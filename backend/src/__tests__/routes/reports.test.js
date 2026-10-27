@@ -20,8 +20,15 @@ jest.mock('pdfkit', () => {
     lineTo: jest.fn().mockReturnThis(),
     stroke: jest.fn().mockReturnThis(),
     addPage: jest.fn().mockReturnThis(),
-    pipe: jest.fn(),
-    end: jest.fn(),
+    pipe: jest.fn(function (destination) {
+      this.destination = destination;
+      return destination;
+    }),
+    end: jest.fn(function () {
+      if (this.destination) {
+        this.destination.end();
+      }
+    }),
     y: 100
   }));
 });
@@ -436,6 +443,228 @@ describe('Report Routes', () => {
         expect.arrayContaining([1, 'test@example.com']),
         expect.any(Function)
       );
+    });
+  });
+
+  describe('PDF Export - successful generation', () => {
+    const PDFDocument = require('pdfkit');
+    const getPdfDoc = () => PDFDocument.mock.results[0].value;
+    const getWrittenText = () => getPdfDoc().text.mock.calls.map((call) => call[0]);
+
+    const mockReport = (client, workEntries) => {
+      mockDb.get.mockImplementation((query, params, callback) => {
+        callback(null, client);
+      });
+
+      mockDb.all.mockImplementation((query, params, callback) => {
+        callback(null, workEntries);
+      });
+    };
+
+    test('should write correct totals and every entry for a report with several entries', async () => {
+      mockReport({ id: 1, name: 'Test Client' }, [
+        { date: '2024-01-04', hours: 1.5, description: 'Work 1', created_at: '2024-01-04' },
+        { date: '2024-01-03', hours: 2.25, description: 'Work 2', created_at: '2024-01-03' },
+        { date: '2024-01-02', hours: 3, description: 'Work 3', created_at: '2024-01-02' },
+        { date: '2024-01-01', hours: '7.25', description: 'Work 4', created_at: '2024-01-01' }
+      ]);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toBe('application/pdf');
+
+      const text = getWrittenText();
+      expect(text).toContain('Time Report for Test Client');
+      expect(text).toContain('Total Hours: 14.00');
+      expect(text).toContain('Total Entries: 4');
+
+      const writtenDates = text.filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value));
+      expect(writtenDates).toEqual(['2024-01-04', '2024-01-03', '2024-01-02', '2024-01-01']);
+      expect(text).toEqual(expect.arrayContaining(['1.5', '2.25', '3', '7.25']));
+      expect(text).toEqual(expect.arrayContaining(['Work 1', 'Work 2', 'Work 3', 'Work 4']));
+      expect(getPdfDoc().end).toHaveBeenCalledTimes(1);
+    });
+
+    test('should generate a report with 0.00 total hours when there are no entries', async () => {
+      mockReport({ id: 1, name: 'Empty Client' }, []);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toBe('application/pdf');
+
+      const text = getWrittenText();
+      expect(text).toContain('Total Hours: 0.00');
+      expect(text).toContain('Total Entries: 0');
+      expect(text).not.toContain('No description');
+      expect(text.filter((value) => /^\d{4}-\d{2}-\d{2}$/.test(value))).toEqual([]);
+      expect(getPdfDoc().addPage).not.toHaveBeenCalled();
+      expect(getPdfDoc().end).toHaveBeenCalledTimes(1);
+    });
+
+    test('should show "No description" for an entry without a description', async () => {
+      mockReport({ id: 1, name: 'Test Client' }, [
+        { date: '2024-01-02', hours: 2, description: 'Described work', created_at: '2024-01-02' },
+        { date: '2024-01-01', hours: 1, description: null, created_at: '2024-01-01' }
+      ]);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      const text = getWrittenText();
+      expect(text).toContain('Described work');
+      expect(text.filter((value) => value === 'No description')).toHaveLength(1);
+    });
+
+    test('should add a new page when entries reach the bottom of the page', async () => {
+      const defaultImplementation = PDFDocument.getMockImplementation();
+      PDFDocument.mockImplementationOnce(() => ({ ...defaultImplementation(), y: 750 }));
+
+      const workEntries = Array.from({ length: 3 }, (_, index) => ({
+        date: `2024-01-0${index + 1}`,
+        hours: 1,
+        description: `Work ${index + 1}`,
+        created_at: `2024-01-0${index + 1}`
+      }));
+      mockReport({ id: 1, name: 'Test Client' }, workEntries);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      expect(getPdfDoc().addPage).toHaveBeenCalledTimes(workEntries.length);
+      expect(getWrittenText()).toContain('Total Entries: 3');
+    });
+
+    test('should make the client name safe in the download filename', async () => {
+      mockReport({ id: 1, name: 'Acme & Sons, Inc./Ltd' }, []);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-disposition']).toMatch(
+        /^attachment; filename="Acme___Sons__Inc__Ltd_report_[A-Za-z0-9_-]+\.pdf"$/
+      );
+      expect(getWrittenText()).toContain('Time Report for Acme & Sons, Inc./Ltd');
+    });
+
+    test('should return 404 and generate nothing for a client owned by another user', async () => {
+      mockDb.get.mockImplementation((query, params, callback) => {
+        const ownedByRequester = params[0] === 1 && params[1] === 'other@example.com';
+        callback(null, ownedByRequester ? { id: 1, name: 'Other User Client' } : undefined);
+      });
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ error: 'Client not found' });
+      expect(response.headers['content-disposition']).toBeUndefined();
+      expect(mockDb.get).toHaveBeenCalledWith(
+        expect.stringContaining('user_email = ?'),
+        [1, 'test@example.com'],
+        expect.any(Function)
+      );
+      expect(mockDb.all).not.toHaveBeenCalled();
+      expect(PDFDocument).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('CSV Export - successful download', () => {
+    const csvWriter = require('csv-writer');
+    const mockClient = { id: 1, name: 'Acme & Sons, Inc./Ltd' };
+    const mockWorkEntries = [
+      { date: '2024-01-02', hours: 1.5, description: 'Work 1', created_at: '2024-01-02' },
+      { date: '2024-01-01', hours: '7.25', description: null, created_at: '2024-01-01' }
+    ];
+    let writeRecords;
+    let downloadSpy;
+    let consoleErrorSpy;
+    let downloadError;
+
+    beforeEach(() => {
+      writeRecords = jest.fn().mockResolvedValue(undefined);
+      csvWriter.createObjectCsvWriter.mockReturnValue({ writeRecords });
+
+      downloadError = null;
+      downloadSpy = jest.spyOn(app.response, 'download').mockImplementation(function (filePath, filename, callback) {
+        this.attachment(filename);
+        this.status(200).send('csv-content');
+        callback(downloadError);
+      });
+      consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      mockDb.get.mockImplementation((query, params, callback) => {
+        callback(null, mockClient);
+      });
+
+      mockDb.all.mockImplementation((query, params, callback) => {
+        callback(null, mockWorkEntries);
+      });
+    });
+
+    afterEach(() => {
+      downloadSpy.mockRestore();
+      consoleErrorSpy.mockRestore();
+    });
+
+    test('should write entries to a temp CSV, download it with a safe filename and delete it', async () => {
+      const response = await request(app).get('/api/reports/export/csv/1');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-disposition']).toMatch(
+        /^attachment; filename="Acme___Sons__Inc__Ltd_report_[A-Za-z0-9_-]+\.csv"$/
+      );
+
+      expect(csvWriter.createObjectCsvWriter).toHaveBeenCalledWith({
+        path: expect.stringMatching(/temp[\\/]Acme___Sons__Inc__Ltd_report_[A-Za-z0-9_-]+\.csv$/),
+        header: [
+          { id: 'date', title: 'Date' },
+          { id: 'hours', title: 'Hours' },
+          { id: 'description', title: 'Description' },
+          { id: 'created_at', title: 'Created At' }
+        ]
+      });
+      expect(writeRecords).toHaveBeenCalledWith(mockWorkEntries);
+
+      const tempPath = csvWriter.createObjectCsvWriter.mock.calls[0][0].path;
+      const filename = tempPath.split(/[\\/]/).pop();
+      expect(downloadSpy).toHaveBeenCalledWith(tempPath, filename, expect.any(Function));
+      expect(fs.unlink).toHaveBeenCalledWith(tempPath, expect.any(Function));
+      expect(consoleErrorSpy).not.toHaveBeenCalled();
+    });
+
+    test('should log and still delete the temp file when sending the file fails', async () => {
+      downloadError = new Error('Download failed');
+
+      await request(app).get('/api/reports/export/csv/1');
+
+      expect(consoleErrorSpy).toHaveBeenCalledWith('Error sending file:', downloadError);
+      expect(fs.unlink).toHaveBeenCalledTimes(1);
+    });
+
+    test('should log when the temp file cannot be deleted', async () => {
+      const unlinkError = new Error('Unlink failed');
+      fs.unlink = jest.fn((filePath, callback) => callback(unlinkError));
+
+      const response = await request(app).get('/api/reports/export/csv/1');
+
+      expect(response.status).toBe(200);
+      expect(consoleErrorSpy).toHaveBeenCalledWith('Error deleting temp file:', unlinkError);
+    });
+
+    test('should return 404 and write no CSV for a client owned by another user', async () => {
+      mockDb.get.mockImplementation((query, params, callback) => {
+        const ownedByRequester = params[0] === 1 && params[1] === 'other@example.com';
+        callback(null, ownedByRequester ? mockClient : undefined);
+      });
+
+      const response = await request(app).get('/api/reports/export/csv/1');
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ error: 'Client not found' });
+      expect(mockDb.all).not.toHaveBeenCalled();
+      expect(csvWriter.createObjectCsvWriter).not.toHaveBeenCalled();
+      expect(downloadSpy).not.toHaveBeenCalled();
     });
   });
 });
