@@ -438,4 +438,230 @@ describe('Report Routes', () => {
       );
     });
   });
+
+  describe('PDF Export - successful generation', () => {
+    const PDFDocument = require('pdfkit');
+
+    // Records text written to the PDF, advances the cursor like pdfkit and
+    // finishes the HTTP response on end() so supertest resolves.
+    const createRecordingPdfDoc = () => ({
+      y: 100,
+      fontSize: jest.fn().mockReturnThis(),
+      text: jest.fn(function (value, x, y) {
+        if (typeof y === 'number') {
+          this.y = y;
+        }
+        this.y += 15;
+        return this;
+      }),
+      moveDown: jest.fn(function (lines = 1) {
+        this.y += 15 * lines;
+        return this;
+      }),
+      moveTo: jest.fn().mockReturnThis(),
+      lineTo: jest.fn().mockReturnThis(),
+      stroke: jest.fn().mockReturnThis(),
+      addPage: jest.fn(function () {
+        this.y = 72;
+        return this;
+      }),
+      pipe: jest.fn(function (res) {
+        this.res = res;
+        return res;
+      }),
+      end: jest.fn(function () {
+        this.res.end();
+      })
+    });
+
+    const writtenText = (doc) => doc.text.mock.calls.map(([value]) => String(value));
+
+    let doc;
+
+    const mockReport = (client, workEntries) => {
+      mockDb.get.mockImplementation((query, params, callback) => {
+        callback(null, client);
+      });
+      mockDb.all.mockImplementation((query, params, callback) => {
+        callback(null, workEntries);
+      });
+    };
+
+    beforeEach(() => {
+      doc = createRecordingPdfDoc();
+      PDFDocument.mockImplementationOnce(() => doc);
+    });
+
+    test('should write correct totals and every entry for a multi-entry report', async () => {
+      const mockWorkEntries = [
+        { date: '2024-01-04', hours: '7.25', description: 'Workshop', created_at: '2024-01-04' },
+        { date: '2024-01-03', hours: 3, description: 'Code review', created_at: '2024-01-03' },
+        { date: '2024-01-02', hours: 2.25, description: 'Planning', created_at: '2024-01-02' },
+        { date: '2024-01-01', hours: 1.5, description: 'Kickoff call', created_at: '2024-01-01' }
+      ];
+      mockReport({ id: 1, name: 'Acme Corp' }, mockWorkEntries);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-type']).toBe('application/pdf');
+      const texts = writtenText(doc);
+      expect(texts).toContain('Time Report for Acme Corp');
+      expect(texts).toContain('Total Hours: 14.00');
+      expect(texts).toContain('Total Entries: 4');
+      mockWorkEntries.forEach((entry) => {
+        expect(texts).toContain(entry.date);
+        expect(texts).toContain(String(entry.hours));
+        expect(texts).toContain(entry.description);
+      });
+      expect(doc.pipe).toHaveBeenCalledTimes(1);
+      expect(doc.end).toHaveBeenCalledTimes(1);
+    });
+
+    test('should generate a PDF with zero totals and no rows when there are no entries', async () => {
+      mockReport({ id: 1, name: 'Empty Client' }, []);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      const texts = writtenText(doc);
+      expect(texts).toContain('Total Hours: 0.00');
+      expect(texts).toContain('Total Entries: 0');
+      expect(texts.slice(texts.indexOf('Description') + 1)).toEqual([]);
+      expect(doc.addPage).not.toHaveBeenCalled();
+      expect(doc.end).toHaveBeenCalledTimes(1);
+    });
+
+    test('should show "No description" for an entry without a description', async () => {
+      mockReport({ id: 1, name: 'Acme Corp' }, [
+        { date: '2024-01-02', hours: 2, description: 'Documented work', created_at: '2024-01-02' },
+        { date: '2024-01-01', hours: 1, description: null, created_at: '2024-01-01' }
+      ]);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      const texts = writtenText(doc);
+      expect(texts.filter((text) => text === 'No description')).toHaveLength(1);
+      expect(texts).toContain('Documented work');
+    });
+
+    test('should add a new page and still write every entry for a long report', async () => {
+      const mockWorkEntries = Array.from({ length: 20 }, (_, i) => ({
+        date: `2024-02-${String(20 - i).padStart(2, '0')}`,
+        hours: 1,
+        description: `Task ${i + 1}`,
+        created_at: '2024-02-01'
+      }));
+      mockReport({ id: 1, name: 'Acme Corp' }, mockWorkEntries);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      expect(doc.addPage).toHaveBeenCalled();
+      const texts = writtenText(doc);
+      expect(texts).toContain('Total Hours: 20.00');
+      expect(texts).toContain('Total Entries: 20');
+      mockWorkEntries.forEach((entry) => {
+        expect(texts.filter((text) => text === entry.date)).toHaveLength(1);
+        expect(texts).toContain(entry.description);
+      });
+      expect(doc.end).toHaveBeenCalledTimes(1);
+    });
+
+    test('should make the client name safe in the download filename', async () => {
+      mockReport({ id: 1, name: 'Acme & Co / "Ltd"' }, []);
+
+      const response = await request(app).get('/api/reports/export/pdf/1');
+
+      expect(response.status).toBe(200);
+      expect(response.headers['content-disposition']).toMatch(
+        /^attachment; filename="Acme___Co____Ltd__report_[A-Za-z0-9-]+\.pdf"$/
+      );
+    });
+  });
+
+  describe('CSV Export - successful generation', () => {
+    let downloadSpy;
+
+    afterEach(() => {
+      downloadSpy.mockRestore();
+    });
+
+    test('should write entries to a temp CSV, download it with a safe filename and delete it', async () => {
+      const mockWorkEntries = [
+        { date: '2024-01-02', hours: 1.5, description: 'Work 2', created_at: '2024-01-02' },
+        { date: '2024-01-01', hours: 7.25, description: 'Work 1', created_at: '2024-01-01' }
+      ];
+      mockDb.get.mockImplementation((query, params, callback) => {
+        callback(null, { id: 1, name: 'Acme & Co' });
+      });
+      mockDb.all.mockImplementation((query, params, callback) => {
+        callback(null, mockWorkEntries);
+      });
+
+      const writeRecords = jest.fn().mockResolvedValue(undefined);
+      const csvWriter = require('csv-writer');
+      csvWriter.createObjectCsvWriter.mockReturnValue({ writeRecords });
+
+      downloadSpy = jest.spyOn(app.response, 'download').mockImplementation(function (filePath, filename, callback) {
+        this.status(200).end();
+        callback(null);
+      });
+
+      const response = await request(app).get('/api/reports/export/csv/1');
+
+      expect(response.status).toBe(200);
+      expect(csvWriter.createObjectCsvWriter).toHaveBeenCalledWith({
+        path: expect.stringMatching(/Acme___Co_report_[A-Za-z0-9-]+\.csv$/),
+        header: [
+          { id: 'date', title: 'Date' },
+          { id: 'hours', title: 'Hours' },
+          { id: 'description', title: 'Description' },
+          { id: 'created_at', title: 'Created At' }
+        ]
+      });
+      expect(writeRecords).toHaveBeenCalledWith(mockWorkEntries);
+
+      const tempPath = csvWriter.createObjectCsvWriter.mock.calls[0][0].path;
+      expect(downloadSpy).toHaveBeenCalledWith(
+        tempPath,
+        expect.stringMatching(/^Acme___Co_report_[A-Za-z0-9-]+\.csv$/),
+        expect.any(Function)
+      );
+      expect(fs.unlink).toHaveBeenCalledWith(tempPath, expect.any(Function));
+    });
+  });
+
+  describe('Export Data Isolation', () => {
+    const PDFDocument = require('pdfkit');
+
+    beforeEach(() => {
+      // The client exists but belongs to another user
+      mockDb.get.mockImplementation((query, params, callback) => {
+        const [clientId, userEmail] = params;
+        const client = clientId === 1 && userEmail === 'other@example.com'
+          ? { id: 1, name: 'Other User Client' }
+          : undefined;
+        callback(null, client);
+      });
+    });
+
+    test.each(['pdf', 'csv'])('should return 404 for another user\'s client on %s export', async (format) => {
+      const csvWriter = require('csv-writer');
+
+      const response = await request(app).get(`/api/reports/export/${format}/1`);
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ error: 'Client not found' });
+      expect(mockDb.get).toHaveBeenCalledWith(
+        expect.stringContaining('user_email = ?'),
+        [1, 'test@example.com'],
+        expect.any(Function)
+      );
+      expect(mockDb.all).not.toHaveBeenCalled();
+      expect(PDFDocument).not.toHaveBeenCalled();
+      expect(csvWriter.createObjectCsvWriter).not.toHaveBeenCalled();
+    });
+  });
 });
